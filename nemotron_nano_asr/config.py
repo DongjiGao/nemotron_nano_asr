@@ -40,6 +40,12 @@ class NemotronNanoASRConfig(PretrainedConfig):
                 self.text_config, "num_key_value_heads", 2
             )
 
+        # Alias for vLLM versions that expect rms_norm_eps
+        if not hasattr(self.text_config, "rms_norm_eps"):
+            self.text_config.rms_norm_eps = getattr(
+                self.text_config, "layer_norm_epsilon", 1e-5
+            )
+
         # Extend vocab to accommodate audio special tokens that will be
         # added to the tokenizer at runtime. The embedding layer uses
         # org_num_embeddings for weight loading so the checkpoint stays
@@ -49,16 +55,27 @@ class NemotronNanoASRConfig(PretrainedConfig):
     def get_text_config(self, decoder=False) -> PretrainedConfig:
         return self.text_config
 
+    _ATTR_ALIASES = {
+        "rms_norm_eps": "layer_norm_epsilon",
+        "layer_norm_eps": "layer_norm_epsilon",
+    }
+
     def __getattr__(self, name):
         if name.startswith("_") or name in (
             "perception", "pretrained_llm", "pretrained_asr",
             "audio_locator_tag", "prompt_format", "pretrained_weights",
-            "text_config",
+            "text_config", "_ATTR_ALIASES",
         ):
             raise AttributeError(name)
+        alias = self._ATTR_ALIASES.get(name, name)
         try:
-            return getattr(self.text_config, name)
+            return getattr(self.text_config, alias)
         except AttributeError:
+            if alias != name:
+                try:
+                    return getattr(self.text_config, name)
+                except AttributeError:
+                    pass
             raise AttributeError(
                 f"'{type(self).__name__}' has no attribute '{name}'"
             )

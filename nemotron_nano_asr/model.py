@@ -7,6 +7,7 @@ Requires NeMo toolkit for the audio encoder:
 
 import re
 from collections.abc import Iterable, Mapping
+from contextlib import nullcontext
 from typing import Annotated, Literal
 
 import torch
@@ -14,12 +15,10 @@ from torch import nn
 from transformers import BatchFeature
 
 from vllm.config import VllmConfig
-from vllm.config.multimodal import BaseDummyOptions
 from vllm.logger import init_logger
 from vllm.model_executor.models.interfaces import (
     IsHybrid,
     MultiModalEmbeddings,
-    SupportsMambaPrefixCaching,
     SupportsMultiModal,
     SupportsPP,
 )
@@ -33,8 +32,11 @@ from vllm.multimodal import MULTIMODAL_REGISTRY
 from vllm.multimodal.inputs import (
     MultiModalDataDict,
     MultiModalFieldConfig,
-    MultiModalKwargsItems,
 )
+try:
+    from vllm.multimodal.inputs import MultiModalKwargsItems
+except ImportError:
+    from vllm.multimodal.inputs import MultiModalKwargsItem as MultiModalKwargsItems
 from vllm.multimodal.parse import (
     AudioProcessorItems,
     MultiModalDataItems,
@@ -43,13 +45,33 @@ from vllm.multimodal.parse import (
 from vllm.multimodal.processing import (
     BaseMultiModalProcessor,
     BaseProcessingInfo,
-    BaseDummyInputsBuilder,
     PromptReplacement,
     PromptUpdate,
     PromptUpdateDetails,
 )
 from vllm.sequence import IntermediateTensors
-from vllm.utils.tensor_schema import TensorSchema, TensorShape
+
+# Version-compatible imports
+try:
+    from vllm.config.multimodal import BaseDummyOptions
+except ImportError:
+    BaseDummyOptions = None
+
+try:
+    from vllm.multimodal.processing import BaseDummyInputsBuilder
+except ImportError:
+    BaseDummyInputsBuilder = None
+
+try:
+    from vllm.model_executor.models.interfaces import SupportsMambaPrefixCaching
+except ImportError:
+    SupportsMambaPrefixCaching = None
+
+try:
+    from vllm.utils.tensor_schema import TensorSchema, TensorShape
+except ImportError:
+    TensorSchema = None
+    TensorShape = None
 
 logger = init_logger(__name__)
 
@@ -86,12 +108,19 @@ def _load_nemo_perception(perception_cfg: dict, output_dim: int) -> nn.Module:
     return perception
 
 
-class NemotronNanoASRAudioInputs(TensorSchema):
-    type: Literal["audio_features"] = "audio_features"
-    audio_signal: Annotated[
-        torch.Tensor | list[torch.Tensor], TensorShape("b", "t")
-    ]
-    audio_signal_length: Annotated[torch.Tensor, TensorShape("b")]
+if TensorSchema is not None:
+    class NemotronNanoASRAudioInputs(TensorSchema):
+        type: Literal["audio_features"] = "audio_features"
+        audio_signal: Annotated[
+            torch.Tensor | list[torch.Tensor], TensorShape("b", "t")
+        ]
+        audio_signal_length: Annotated[torch.Tensor, TensorShape("b")]
+else:
+    from dataclasses import dataclass as _dc
+    @_dc
+    class NemotronNanoASRAudioInputs:
+        audio_signal: object = None
+        audio_signal_length: object = None
 
 
 class NemotronNanoASRProcessingInfo(BaseProcessingInfo):
@@ -226,30 +255,57 @@ class NemotronNanoASRMultiModalProcessor(
         return result
 
 
-class NemotronNanoASRDummyInputsBuilder(
-    BaseDummyInputsBuilder[NemotronNanoASRProcessingInfo],
-):
+if BaseDummyInputsBuilder is not None:
+    _DummyBase = BaseDummyInputsBuilder[NemotronNanoASRProcessingInfo]
+else:
+    class _DummyBase:
+        def __init__(self, info):
+            self.info = info
+
+class NemotronNanoASRDummyInputsBuilder(_DummyBase):
+
+    def _get_dummy_audios(self, *, length, num_audios, **kwargs):
+        import numpy as np
+        if num_audios == 0:
+            return []
+        return [np.zeros((length,))] * num_audios
 
     def get_dummy_mm_data(
         self,
         seq_len: int,
         mm_counts: Mapping[str, int],
-        mm_options: Mapping[str, BaseDummyOptions] | None = None,
+        mm_options: Mapping[str, object] | None = None,
         **kwargs,
     ) -> MultiModalDataDict:
         num_audios = mm_counts.get("audio", 0)
-        audio_overrides = mm_options.get("audio") if mm_options else None
         return {
             "audio": self._get_dummy_audios(
                 length=self.info.get_max_audio_len(),
                 num_audios=num_audios,
-                overrides=audio_overrides,
             )
         }
 
     def get_dummy_text(self, mm_counts: Mapping[str, int]) -> str:
         num_audios = mm_counts.get("audio", 0)
         return "Transcribe the following: " + _AUDIO_PLACEHOLDER * num_audios
+
+    def get_dummy_processor_inputs(self, seq_len, mm_counts):
+        try:
+            from vllm.multimodal.profiling import ProcessorInputs
+        except ImportError:
+            from dataclasses import dataclass, field
+            @dataclass
+            class ProcessorInputs:
+                prompt: object = ""
+                mm_data: object = None
+                hf_processor_mm_kwargs: object = None
+                tokenization_kwargs: object = None
+        return ProcessorInputs(
+            prompt=self.get_dummy_text(mm_counts),
+            mm_data=self.get_dummy_mm_data(seq_len, mm_counts),
+            hf_processor_mm_kwargs={},
+            tokenization_kwargs={"truncation": False},
+        )
 
 
 @MULTIMODAL_REGISTRY.register_processor(
@@ -262,7 +318,6 @@ class NemotronNanoASRForConditionalGeneration(
     SupportsMultiModal,
     SupportsPP,
     IsHybrid,
-    SupportsMambaPrefixCaching,
 ):
 
     @classmethod
@@ -273,35 +328,35 @@ class NemotronNanoASRForConditionalGeneration(
 
     @classmethod
     def get_mamba_state_dtype_from_config(cls, vllm_config):
-        from vllm.model_executor.models.nemotron_h import (
-            NemotronHForCausalLM,
-        )
-        return NemotronHForCausalLM.get_mamba_state_dtype_from_config(
-            vllm_config
-        )
+        from vllm.model_executor.models.nemotron_h import NemotronHForCausalLM
+        if hasattr(NemotronHForCausalLM, 'get_mamba_state_dtype_from_config'):
+            return NemotronHForCausalLM.get_mamba_state_dtype_from_config(vllm_config)
+        return None
 
     @classmethod
     def get_mamba_state_shape_from_config(cls, vllm_config):
-        from vllm.model_executor.models.nemotron_h import (
-            NemotronHForCausalLM,
-        )
-        return NemotronHForCausalLM.get_mamba_state_shape_from_config(
-            vllm_config
-        )
+        from vllm.model_executor.models.nemotron_h import NemotronHForCausalLM
+        if hasattr(NemotronHForCausalLM, 'get_mamba_state_shape_from_config'):
+            return NemotronHForCausalLM.get_mamba_state_shape_from_config(vllm_config)
+        return None
 
     @classmethod
     def get_mamba_state_copy_func(cls):
-        from vllm.model_executor.models.nemotron_h import (
-            NemotronHForCausalLM,
-        )
-        return NemotronHForCausalLM.get_mamba_state_copy_func()
+        from vllm.model_executor.models.nemotron_h import NemotronHForCausalLM
+        if hasattr(NemotronHForCausalLM, 'get_mamba_state_copy_func'):
+            return NemotronHForCausalLM.get_mamba_state_copy_func()
+        return None
 
     def __init__(self, *, vllm_config: VllmConfig, prefix: str = ""):
         super().__init__()
         config = vllm_config.model_config.hf_config
         self.config = config
 
-        with self._mark_language_model(vllm_config):
+        _mark_lm = getattr(self, '_mark_language_model', None)
+        _mark_tw = getattr(self, '_mark_tower_model', None)
+
+        ctx_lm = _mark_lm(vllm_config) if _mark_lm else nullcontext()
+        with ctx_lm:
             self.language_model = init_vllm_registered_model(
                 vllm_config=vllm_config,
                 hf_config=config.text_config,
@@ -311,7 +366,8 @@ class NemotronNanoASRForConditionalGeneration(
 
         llm_hidden = config.text_config.hidden_size
 
-        with self._mark_tower_model(vllm_config, {"audio"}):
+        ctx_tw = _mark_tw(vllm_config, {"audio"}) if _mark_tw else nullcontext()
+        with ctx_tw:
             self.perception = _load_nemo_perception(
                 config.perception, output_dim=llm_hidden
             )
