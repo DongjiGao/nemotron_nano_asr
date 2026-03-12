@@ -32,7 +32,7 @@ def main():
     )
     sampling_params = SamplingParams(max_tokens=256, temperature=0.0)
 
-    prompt = "<|im_start|>system\n<|im_end|>\n<|im_start|>user\nTranscribe the following: <|audio|><|im_end|>\n<|im_start|>assistant\n"
+    prompt = "<|im_start|>system\n<|im_end|>\n<|im_start|>user\nTranscribe the following: <|audio|><|im_end|>\n<|im_start|>assistant\n<think>\n"
 
     for idx in [0, 9]:
         item = ds[idx]
