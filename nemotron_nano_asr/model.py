@@ -15,10 +15,12 @@ from torch import nn
 from transformers import BatchFeature
 
 from vllm.config import VllmConfig
+from vllm.config.multimodal import BaseDummyOptions
 from vllm.logger import init_logger
 from vllm.model_executor.models.interfaces import (
     IsHybrid,
     MultiModalEmbeddings,
+    SupportsMambaPrefixCaching,
     SupportsMultiModal,
     SupportsPP,
 )
@@ -32,11 +34,8 @@ from vllm.multimodal import MULTIMODAL_REGISTRY
 from vllm.multimodal.inputs import (
     MultiModalDataDict,
     MultiModalFieldConfig,
+    MultiModalKwargsItems,
 )
-try:
-    from vllm.multimodal.inputs import MultiModalKwargsItems
-except ImportError:
-    from vllm.multimodal.inputs import MultiModalKwargsItem as MultiModalKwargsItems
 from vllm.multimodal.parse import (
     AudioProcessorItems,
     MultiModalDataItems,
@@ -49,29 +48,9 @@ from vllm.multimodal.processing import (
     PromptUpdate,
     PromptUpdateDetails,
 )
+from vllm.multimodal.processing.dummy_inputs import BaseDummyInputsBuilder
 from vllm.sequence import IntermediateTensors
-
-# Version-compatible imports
-try:
-    from vllm.config.multimodal import BaseDummyOptions
-except ImportError:
-    BaseDummyOptions = None
-
-try:
-    from vllm.multimodal.processing import BaseDummyInputsBuilder
-except ImportError:
-    BaseDummyInputsBuilder = None
-
-try:
-    from vllm.model_executor.models.interfaces import SupportsMambaPrefixCaching
-except ImportError:
-    SupportsMambaPrefixCaching = None
-
-try:
-    from vllm.utils.tensor_schema import TensorSchema, TensorShape
-except ImportError:
-    TensorSchema = None
-    TensorShape = None
+from vllm.utils.tensor_schema import TensorSchema, TensorShape
 
 logger = init_logger(__name__)
 
@@ -108,19 +87,12 @@ def _load_nemo_perception(perception_cfg: dict, output_dim: int) -> nn.Module:
     return perception
 
 
-if TensorSchema is not None:
-    class NemotronNanoASRAudioInputs(TensorSchema):
-        type: Literal["audio_features"] = "audio_features"
-        audio_signal: Annotated[
-            torch.Tensor | list[torch.Tensor], TensorShape("b", "t")
-        ]
-        audio_signal_length: Annotated[torch.Tensor, TensorShape("b")]
-else:
-    from dataclasses import dataclass as _dc
-    @_dc
-    class NemotronNanoASRAudioInputs:
-        audio_signal: object = None
-        audio_signal_length: object = None
+class NemotronNanoASRAudioInputs(TensorSchema):
+    type: Literal["audio_features"] = "audio_features"
+    audio_signal: Annotated[
+        torch.Tensor | list[torch.Tensor], TensorShape("b", "t")
+    ]
+    audio_signal_length: Annotated[torch.Tensor, TensorShape("b")]
 
 
 class NemotronNanoASRProcessingInfo(BaseProcessingInfo):
@@ -255,27 +227,15 @@ class NemotronNanoASRMultiModalProcessor(
         return result
 
 
-if BaseDummyInputsBuilder is not None:
-    _DummyBase = BaseDummyInputsBuilder[NemotronNanoASRProcessingInfo]
-else:
-    class _DummyBase:
-        def __init__(self, info):
-            self.info = info
-
-class NemotronNanoASRDummyInputsBuilder(_DummyBase):
-
-    def _get_dummy_audios(self, *, length, num_audios, **kwargs):
-        import numpy as np
-        if num_audios == 0:
-            return []
-        return [np.zeros((length,))] * num_audios
+class NemotronNanoASRDummyInputsBuilder(
+    BaseDummyInputsBuilder[NemotronNanoASRProcessingInfo],
+):
 
     def get_dummy_mm_data(
         self,
         seq_len: int,
         mm_counts: Mapping[str, int],
-        mm_options: Mapping[str, object] | None = None,
-        **kwargs,
+        mm_options: Mapping[str, BaseDummyOptions],
     ) -> MultiModalDataDict:
         num_audios = mm_counts.get("audio", 0)
         return {
@@ -289,24 +249,6 @@ class NemotronNanoASRDummyInputsBuilder(_DummyBase):
         num_audios = mm_counts.get("audio", 0)
         return "Transcribe the following: " + _AUDIO_PLACEHOLDER * num_audios
 
-    def get_dummy_processor_inputs(self, seq_len, mm_counts):
-        try:
-            from vllm.multimodal.profiling import ProcessorInputs
-        except ImportError:
-            from dataclasses import dataclass, field
-            @dataclass
-            class ProcessorInputs:
-                prompt: object = ""
-                mm_data: object = None
-                hf_processor_mm_kwargs: object = None
-                tokenization_kwargs: object = None
-        return ProcessorInputs(
-            prompt=self.get_dummy_text(mm_counts),
-            mm_data=self.get_dummy_mm_data(seq_len, mm_counts),
-            hf_processor_mm_kwargs={},
-            tokenization_kwargs={"truncation": False},
-        )
-
 
 @MULTIMODAL_REGISTRY.register_processor(
     NemotronNanoASRMultiModalProcessor,
@@ -318,6 +260,7 @@ class NemotronNanoASRForConditionalGeneration(
     SupportsMultiModal,
     SupportsPP,
     IsHybrid,
+    SupportsMambaPrefixCaching,
 ):
 
     @classmethod
@@ -329,34 +272,24 @@ class NemotronNanoASRForConditionalGeneration(
     @classmethod
     def get_mamba_state_dtype_from_config(cls, vllm_config):
         from vllm.model_executor.models.nemotron_h import NemotronHForCausalLM
-        if hasattr(NemotronHForCausalLM, 'get_mamba_state_dtype_from_config'):
-            return NemotronHForCausalLM.get_mamba_state_dtype_from_config(vllm_config)
-        return None
+        return NemotronHForCausalLM.get_mamba_state_dtype_from_config(vllm_config)
 
     @classmethod
     def get_mamba_state_shape_from_config(cls, vllm_config):
         from vllm.model_executor.models.nemotron_h import NemotronHForCausalLM
-        if hasattr(NemotronHForCausalLM, 'get_mamba_state_shape_from_config'):
-            return NemotronHForCausalLM.get_mamba_state_shape_from_config(vllm_config)
-        return None
+        return NemotronHForCausalLM.get_mamba_state_shape_from_config(vllm_config)
 
     @classmethod
     def get_mamba_state_copy_func(cls):
         from vllm.model_executor.models.nemotron_h import NemotronHForCausalLM
-        if hasattr(NemotronHForCausalLM, 'get_mamba_state_copy_func'):
-            return NemotronHForCausalLM.get_mamba_state_copy_func()
-        return None
+        return NemotronHForCausalLM.get_mamba_state_copy_func()
 
     def __init__(self, *, vllm_config: VllmConfig, prefix: str = ""):
         super().__init__()
         config = vllm_config.model_config.hf_config
         self.config = config
 
-        _mark_lm = getattr(self, '_mark_language_model', None)
-        _mark_tw = getattr(self, '_mark_tower_model', None)
-
-        ctx_lm = _mark_lm(vllm_config) if _mark_lm else nullcontext()
-        with ctx_lm:
+        with self._mark_language_model(vllm_config):
             self.language_model = init_vllm_registered_model(
                 vllm_config=vllm_config,
                 hf_config=config.text_config,
@@ -366,8 +299,7 @@ class NemotronNanoASRForConditionalGeneration(
 
         llm_hidden = config.text_config.hidden_size
 
-        ctx_tw = _mark_tw(vllm_config, {"audio"}) if _mark_tw else nullcontext()
-        with ctx_tw:
+        with self._mark_tower_model(vllm_config, {"audio"}):
             self.perception = _load_nemo_perception(
                 config.perception, output_dim=llm_hidden
             )
@@ -425,15 +357,6 @@ class NemotronNanoASRForConditionalGeneration(
 
         audio_embeds = audio_embeds.to(torch.bfloat16)
 
-        logger.info(
-            "_process_audio: input_len=%s, embed_shape=%s, "
-            "embed_lens=%s, dtype=%s",
-            audio_lengths.tolist(),
-            audio_embeds.shape,
-            audio_embed_lens.tolist(),
-            audio_embeds.dtype,
-        )
-
         return tuple(
             audio_embeds[i, : audio_embed_lens[i]]
             for i in range(audio_embeds.shape[0])
@@ -475,18 +398,10 @@ class NemotronNanoASRForConditionalGeneration(
         self, weights: Iterable[tuple[str, torch.Tensor]]
     ) -> Iterable[tuple[str, torch.Tensor]]:
         """Convert NeMo checkpoint weight names to HuggingFace NemotronH
-        format that vLLM's NemotronHForCausalLM.load_weights() expects.
-
-        Key conversions:
-        - llm.model.* -> backbone.* (HF prefix)
-        - experts.down_projs [N,I,H] -> experts.{i}.down_proj.weight [I,H]
-        - experts.gate_and_up_projs [N,H,I] -> experts.{i}.up_proj.weight [H,I]
-        """
+        format that vLLM's NemotronHForCausalLM.load_weights() expects."""
         for name, tensor in weights:
-            # NeMo uses llm.model.*, HF uses backbone.*
             hf_name = name.replace("llm.model.", "backbone.")
             hf_name = hf_name.replace("llm.lm_head", "lm_head")
-            # Final layernorm: NeMo "norm" -> HF/vLLM "norm_f"
             if hf_name == "backbone.norm.weight":
                 hf_name = "backbone.norm_f.weight"
 
