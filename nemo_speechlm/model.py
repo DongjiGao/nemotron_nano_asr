@@ -1,6 +1,7 @@
-"""Inference-only Nemotron-Nano-v3 + Canary-v2 ASR model for vLLM.
+"""Inference-only NeMo Speech LM model for vLLM.
 
-Architecture: FastConformer encoder (NeMo) + projection + NemotronH LLM.
+Architecture: NeMo speech encoder (e.g. FastConformer) + projection + LLM backbone.
+Supports any combination of encoder and LLM defined by checkpoint config.
 Requires NeMo toolkit for the audio encoder:
     pip install nemo_toolkit[asr]
 """
@@ -55,14 +56,12 @@ from vllm.utils.tensor_schema import TensorSchema, TensorShape
 logger = init_logger(__name__)
 
 _AUDIO_PLACEHOLDER = "<|audio|>"
-_AUDIO_START = "<|audio_start|>"
-_AUDIO_END = "<|audio_end|>"
 _SAMPLING_RATE = 16000
 _MAX_AUDIO_DURATION_S = 40.0
 
 
 def _ensure_special_tokens(tokenizer):
-    special = [_AUDIO_PLACEHOLDER, _AUDIO_START, _AUDIO_END]
+    special = [_AUDIO_PLACEHOLDER]
     existing = set(tokenizer.get_vocab().keys())
     to_add = [t for t in special if t not in existing]
     if to_add:
@@ -87,7 +86,7 @@ def _load_nemo_perception(perception_cfg: dict, output_dim: int) -> nn.Module:
     return perception
 
 
-class NemotronNanoASRAudioInputs(TensorSchema):
+class NeMoSpeechLMAudioInputs(TensorSchema):
     type: Literal["audio_features"] = "audio_features"
     audio_signal: Annotated[
         torch.Tensor | list[torch.Tensor], TensorShape("b", "t")
@@ -95,7 +94,7 @@ class NemotronNanoASRAudioInputs(TensorSchema):
     audio_signal_length: Annotated[torch.Tensor, TensorShape("b")]
 
 
-class NemotronNanoASRProcessingInfo(BaseProcessingInfo):
+class NeMoSpeechLMProcessingInfo(BaseProcessingInfo):
 
     def get_data_parser(self) -> MultiModalDataParser:
         return MultiModalDataParser(
@@ -128,8 +127,8 @@ class NemotronNanoASRProcessingInfo(BaseProcessingInfo):
         return max(1, int(length))
 
 
-class NemotronNanoASRMultiModalProcessor(
-    BaseMultiModalProcessor[NemotronNanoASRProcessingInfo],
+class NeMoSpeechLMMultiModalProcessor(
+    BaseMultiModalProcessor[NeMoSpeechLMProcessingInfo],
 ):
 
     def _get_mm_fields_config(
@@ -161,9 +160,7 @@ class NemotronNanoASRMultiModalProcessor(
             audios = mm_items.get_items("audio", AudioProcessorItems)
             audio = audios.get(item_idx)
             n_tokens = self.info._estimate_audio_tokens(audio.shape[-1])
-            repl_full = (
-                _AUDIO_START + _AUDIO_PLACEHOLDER * n_tokens + _AUDIO_END
-            )
+            repl_full = _AUDIO_PLACEHOLDER * n_tokens
             return PromptUpdateDetails.select_text(
                 repl_full, _AUDIO_PLACEHOLDER
             )
@@ -207,11 +204,7 @@ class NemotronNanoASRMultiModalProcessor(
                     n_tokens = self.info._estimate_audio_tokens(
                         audio_tensor.shape[-1]
                     )
-                    parts[i] = (
-                        _AUDIO_START
-                        + _AUDIO_PLACEHOLDER * n_tokens
-                        + _AUDIO_END
-                    )
+                    parts[i] = _AUDIO_PLACEHOLDER * n_tokens
                     audio_list.append(audio_tensor)
                     audio_lengths.append(audio_tensor.shape[-1])
                     audio_idx += 1
@@ -227,8 +220,8 @@ class NemotronNanoASRMultiModalProcessor(
         return result
 
 
-class NemotronNanoASRDummyInputsBuilder(
-    BaseDummyInputsBuilder[NemotronNanoASRProcessingInfo],
+class NeMoSpeechLMDummyInputsBuilder(
+    BaseDummyInputsBuilder[NeMoSpeechLMProcessingInfo],
 ):
 
     def get_dummy_mm_data(
@@ -251,11 +244,11 @@ class NemotronNanoASRDummyInputsBuilder(
 
 
 @MULTIMODAL_REGISTRY.register_processor(
-    NemotronNanoASRMultiModalProcessor,
-    info=NemotronNanoASRProcessingInfo,
-    dummy_inputs=NemotronNanoASRDummyInputsBuilder,
+    NeMoSpeechLMMultiModalProcessor,
+    info=NeMoSpeechLMProcessingInfo,
+    dummy_inputs=NeMoSpeechLMDummyInputsBuilder,
 )
-class NemotronNanoASRForConditionalGeneration(
+class NeMoSpeechLMForConditionalGeneration(
     nn.Module,
     SupportsMultiModal,
     SupportsPP,
@@ -311,7 +304,7 @@ class NemotronNanoASRForConditionalGeneration(
 
     def _parse_audio_input(
         self, **kwargs
-    ) -> NemotronNanoASRAudioInputs | None:
+    ) -> NeMoSpeechLMAudioInputs | None:
         audio_signal = kwargs.pop("audio_signal", None)
         if audio_signal is None:
             return None
@@ -332,13 +325,13 @@ class NemotronNanoASRForConditionalGeneration(
         elif not isinstance(audio_signal_length, torch.Tensor):
             audio_signal_length = torch.tensor(audio_signal_length)
 
-        return NemotronNanoASRAudioInputs(
+        return NeMoSpeechLMAudioInputs(
             audio_signal=audio_signal,
             audio_signal_length=audio_signal_length,
         )
 
     def _process_audio(
-        self, audio_input: NemotronNanoASRAudioInputs
+        self, audio_input: NeMoSpeechLMAudioInputs
     ) -> tuple[torch.Tensor, ...]:
         device = next(self.perception.parameters()).device
         self.perception = self.perception.to(device)

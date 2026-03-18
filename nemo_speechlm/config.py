@@ -1,15 +1,14 @@
-"""Configuration for Nemotron-Nano-v3 + Canary-v2 ASR model.
+"""Configuration for NeMo Speech LM models in vLLM.
 
-The checkpoint uses NeMo format config.json. Users must pass hf_overrides:
-    --hf-overrides '{"architectures": ["NemotronNanoASRForConditionalGeneration"],
-                     "model_type": "nemotron_nano_asr"}'
+Supports any combination of NeMo speech encoder + LLM backbone.
+The checkpoint config.json defines which components to use.
 """
 
 from transformers import AutoConfig, PretrainedConfig
 
 
-class NemotronNanoASRConfig(PretrainedConfig):
-    model_type = "nemotron_nano_asr"
+class NeMoSpeechLMConfig(PretrainedConfig):
+    model_type = "nemo_speechlm"
 
     def __init__(
         self,
@@ -40,16 +39,11 @@ class NemotronNanoASRConfig(PretrainedConfig):
                 self.text_config, "num_key_value_heads", 2
             )
 
-        # Alias for vLLM versions that expect rms_norm_eps
         if not hasattr(self.text_config, "rms_norm_eps"):
             self.text_config.rms_norm_eps = getattr(
                 self.text_config, "layer_norm_epsilon", 1e-5
             )
 
-        # Extend vocab to accommodate audio special tokens that will be
-        # added to the tokenizer at runtime. The embedding layer uses
-        # org_num_embeddings for weight loading so the checkpoint stays
-        # compatible.
         self.text_config.vocab_size = self.text_config.vocab_size + 10
 
     def get_text_config(self, decoder=False) -> PretrainedConfig:

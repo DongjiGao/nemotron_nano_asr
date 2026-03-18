@@ -1,20 +1,18 @@
 def register():
-    from nemotron_nano_asr.config import NemotronNanoASRConfig
+    from nemo_speechlm.config import NeMoSpeechLMConfig
 
     from transformers import AutoConfig
-    AutoConfig.register("nemotron_nano_asr", NemotronNanoASRConfig)
+    AutoConfig.register("nemo_speechlm", NeMoSpeechLMConfig)
 
     from vllm.transformers_utils.config import _CONFIG_REGISTRY
-    _CONFIG_REGISTRY["nemotron_nano_asr"] = NemotronNanoASRConfig
+    _CONFIG_REGISTRY["nemo_speechlm"] = NeMoSpeechLMConfig
 
     from vllm.model_executor.models.registry import ModelRegistry
     ModelRegistry.register_model(
-        "NemotronNanoASRForConditionalGeneration",
-        "nemotron_nano_asr.model:NemotronNanoASRForConditionalGeneration",
+        "NeMoSpeechLMForConditionalGeneration",
+        "nemo_speechlm.model:NeMoSpeechLMForConditionalGeneration",
     )
 
-    # Patch NemotronHConfig to add rms_norm_eps alias if missing
-    # (vLLM 0.10 references it but HF config uses layer_norm_epsilon)
     try:
         from transformers import AutoConfig as _AC
         _nhc = _AC.from_pretrained(
