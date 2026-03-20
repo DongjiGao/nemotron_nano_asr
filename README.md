@@ -308,6 +308,29 @@ This submits 8 Slurm jobs. Each loads the model on 1 GPU, processes its chunk,
 and writes `output_chunk_N.jsonl`. When all chunks finish, results are merged
 into `output.jsonl`.
 
+### Summarize results with `ns summarize_results`
+
+After `ns generate` completes, compute corpus-level WER:
+
+```bash
+# Create directory structure expected by ns summarize_results
+mkdir -p ${OUTDIR}/../summary/asr-leaderboard
+ln -sf ${OUTDIR}/output.jsonl ${OUTDIR}/../summary/asr-leaderboard/output.jsonl
+
+# Run summarization
+ns summarize_results ${OUTDIR}/../summary
+```
+
+**Expected output**:
+```
+------------------------------------- asr-leaderboard -------------------------------------
+evaluation_mode | avg_tokens | gen_seconds | success_rate | no_answer | wer   | num_entries
+pass@1          | -1         | 108         | 99.54%       | 0.00%     | 1.91% | 2620
+```
+
+This computes corpus-level WER using the same method as the NeMo checkpoint evaluation.
+Metrics are also saved to `metrics.json` for programmatic access.
+
 **Monitor progress:**
 ```bash
 squeue -u $USER  # check running jobs
@@ -339,6 +362,59 @@ ami.jsonl                 (11,653 samples)
 ```
 All at: `/lustre/fsw/portfolios/llmservice/users/dongjig/asr-leaderboard-data/nemo_skills_jsonl/`
 
+## Step 9: Run full leaderboard with `ns eval` (all-in-one)
+
+`ns eval` combines generate + evaluate + summarize in one command. It reads
+benchmark data from `nemo_skills/dataset/asr-leaderboard/`, runs inference,
+computes WER, and prints a summary table.
+
+**Prerequisites**: The JSONL files in `nemo_skills/dataset/asr-leaderboard/`
+must include audio paths in messages (see Step 1 for setup).
+
+```bash
+ns eval \
+    --cluster draco \
+    --config_dir /home/dongjig/Skills/cluster_configs \
+    --benchmarks asr-leaderboard \
+    --output_dir /lustre/fsw/portfolios/llmservice/users/$USER/results/ns_eval_test \
+    --model /lustre/fsw/portfolios/llmservice/users/dongjig/models/nemotron-nano-asr-ckpt \
+    --server_type generic \
+    --server_entrypoint "bash /lustre/fsw/portfolios/llmservice/users/dongjig/scripts/serve_with_nvme.sh" \
+    --server_args "--backend vllm_nemo_speechlm --batch_size 32 \
+        --tokenizer nvidia/NVIDIA-Nemotron-3-Nano-30B-A3B-BF16 \
+        --gpu_memory_utilization 0.90" \
+    --server_container /lustre/fsw/portfolios/llmservice/users/dongjig/containers/vllm-asr-v3.sqsh \
+    --server_gpus 1 \
+    --num_chunks 8 \
+    --expname ns-eval-test \
+    --installation_command "true" \
+    ++server.server_type=vllm_multimodal \
+    ++max_concurrent_requests=32 \
+    ++inference.temperature=0.0 \
+    ++inference.tokens_to_generate=512 \
+    ++enable_audio_chunking=true
+```
+
+After all chunks finish, run `ns summarize_results`:
+```bash
+ns summarize_results /lustre/fsw/portfolios/llmservice/users/$USER/results/ns_eval_test/eval-results
+```
+
+**Expected output** (verified):
+```
+------------------------------------- asr-leaderboard -------------------------------------
+evaluation_mode | avg_tokens | gen_seconds | success_rate | no_answer | wer   | num_entries
+pass@1          | -1         | 1309        | 98.43%       | 0.05%     | 4.65% | 67795
+
+Dataset breakdown:
+  librispeech_clean:  1.93%  (2,620 samples)
+  librispeech_other:  3.69%  (2,939 samples)
+  tedlium:            3.70%  (1,155 samples)
+  spgispeech:         2.21%  (39,341 samples)
+  voxpopuli:          6.27%  (1,842 samples)
+  gigaspeech:        10.08%  (19,898 samples)
+```
+
 ## Summary of expected results
 
 | Test | Expected |
@@ -347,3 +423,4 @@ All at: `/lustre/fsw/portfolios/llmservice/users/dongjig/asr-leaderboard-data/ne
 | Step 6: Server request | JSON with transcription |
 | Step 7: Single GPU eval | 1.91% WER, ~7.5 min (99s load + 349s inference) |
 | Step 8: 8-GPU eval (v3 container) | 1.91% WER, ~2.4 min wall-clock (46s load + 96s inference) |
+| Step 9: Full leaderboard via ns eval | 4.65% avg WER across 6 datasets, ~20 min |
