@@ -579,11 +579,33 @@ class NeMoSpeechLMStdForConditionalGeneration(
     # ── LoRA merge ──
 
     @staticmethod
+    def _normalize_lora_name(name: str) -> tuple[str, str]:
+        """Classify a weight name and return (normalized_name, kind).
+
+        Returns kind: "lora_a", "lora_b", or "base".
+        Normalizes both PEFT and NeMo LoRA naming to a common base key.
+          PEFT:  q_proj.lora_A.default.weight → (q_proj.weight, lora_a)
+          NeMo:  q_proj.lora_A.weight         → (q_proj.weight, lora_a)
+          PEFT:  q_proj.base_layer.weight      → (q_proj.weight, base)
+          Plain: q_proj.weight                 → (q_proj.weight, base)
+        """
+        import re
+        m = re.match(r"(.+)\.lora_(A|B)(?:\.default)?\.weight$", name)
+        if m:
+            return m.group(1) + ".weight", "lora_" + m.group(2).lower()
+        if ".base_layer." in name:
+            return name.replace(".base_layer.", "."), "base"
+        return name, "base"
+
+    @staticmethod
     def _merge_lora_weights(
         weights: list[tuple[str, torch.Tensor]],
         lora_cfg: dict | None,
     ) -> Iterable[tuple[str, torch.Tensor]]:
-        """Merge PEFT LoRA A/B into base weights in float32."""
+        """Merge LoRA A/B into base weights in float32.
+
+        Handles both PEFT and NeMo LoRA naming conventions.
+        """
         has_lora = any(
             ".lora_A." in n or ".lora_B." in n for n, _ in weights
         )
@@ -595,23 +617,19 @@ class NeMoSpeechLMStdForConditionalGeneration(
             lora_cfg = {"r": 128, "lora_alpha": 256}
         scaling = lora_cfg.get("lora_alpha", 1) / lora_cfg.get("r", 1)
 
+        normalize = NeMoSpeechLMStdForConditionalGeneration._normalize_lora_name
         base: dict[str, torch.Tensor] = {}
         lora_a: dict[str, torch.Tensor] = {}
         lora_b: dict[str, torch.Tensor] = {}
-        other: list[tuple[str, torch.Tensor]] = []
 
         for name, tensor in weights:
-            if ".lora_A.default.weight" in name:
-                key = name.replace(".lora_A.default.weight", ".weight")
+            key, kind = normalize(name)
+            if kind == "lora_a":
                 lora_a[key] = tensor
-            elif ".lora_B.default.weight" in name:
-                key = name.replace(".lora_B.default.weight", ".weight")
+            elif kind == "lora_b":
                 lora_b[key] = tensor
-            elif ".base_layer.weight" in name:
-                key = name.replace(".base_layer.weight", ".weight")
-                base[key] = tensor
             else:
-                other.append((name, tensor))
+                base[key] = tensor
 
         merged_count = 0
         for key, tensor in base.items():
@@ -628,7 +646,8 @@ class NeMoSpeechLMStdForConditionalGeneration(
             merged_count,
             scaling,
         )
-        yield from other
+        if lora_a:
+            logger.warning("Unmerged LoRA keys: %s", list(lora_a.keys()))
 
     # ── weight name mapping ──
 
@@ -642,16 +661,21 @@ class NeMoSpeechLMStdForConditionalGeneration(
           - Plain NeMo:   ``llm.model.`` -> ``model.``
           - Standalone:   ``embed_tokens.weight`` -> ``model.embed_tokens.weight``
           - LM head:      ``llm.lm_head.weight`` -> ``lm_head.weight``
+          - Weight tying:  if no embed_tokens, duplicate lm_head as embed_tokens
         """
         target_vocab = getattr(
             self.config.text_config, "vocab_size", None
         )
+
+        has_embed_tokens = False
+        lm_head_tensor = None
 
         for name, tensor in weights:
             if name == "embed_tokens.weight":
                 if target_vocab:
                     tensor = _pad_vocab_tensor(tensor, target_vocab)
                 yield ("model.embed_tokens.weight", tensor)
+                has_embed_tokens = True
                 continue
 
             hf = name
@@ -663,8 +687,19 @@ class NeMoSpeechLMStdForConditionalGeneration(
             if hf.startswith("lm_head") or hf.startswith("model.embed_tokens"):
                 if target_vocab:
                     tensor = _pad_vocab_tensor(tensor, target_vocab)
+                if hf.startswith("model.embed_tokens"):
+                    has_embed_tokens = True
+
+            if hf == "lm_head.weight":
+                lm_head_tensor = tensor
 
             yield (hf, tensor)
+
+        if not has_embed_tokens and lm_head_tensor is not None:
+            logger.info("No embed_tokens found; duplicating lm_head (weight tying)")
+            if target_vocab:
+                lm_head_tensor = _pad_vocab_tensor(lm_head_tensor, target_vocab)
+            yield ("model.embed_tokens.weight", lm_head_tensor)
 
     def load_weights(
         self, weights: Iterable[tuple[str, torch.Tensor]]
