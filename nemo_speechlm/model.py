@@ -1,14 +1,35 @@
+# Copyright (c) 2026, NVIDIA CORPORATION.  All rights reserved.
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
 """Inference-only NeMo Speech LM model for vLLM.
 
-Architecture: NeMo speech encoder (e.g. FastConformer) + projection + LLM backbone.
-Supports any combination of encoder and LLM defined by checkpoint config.
+Architecture: NeMo speech encoder (e.g. FastConformer) + projection + LLM.
+Two concrete classes share a common base:
+
+  NeMoSpeechLMForConditionalGeneration
+      Hybrid backends (Mamba+MoE, e.g. NemotronH).
+
+  NeMoSpeechLMStdForConditionalGeneration
+      Standard transformer backends (e.g. Qwen3, Parakeet-TDT).
+      Includes inline LoRA merging for PEFT checkpoints.
+
 Requires NeMo toolkit for the audio encoder:
     pip install nemo_toolkit[asr]
 """
 
 import re
 from collections.abc import Iterable, Mapping
-from contextlib import nullcontext
 from typing import Annotated, Literal
 
 import torch
@@ -60,6 +81,9 @@ _SAMPLING_RATE = 16000
 _MAX_AUDIO_DURATION_S = 40.0
 
 
+# ── Helpers ─────────────────────────────────────────────────────────
+
+
 def _ensure_special_tokens(tokenizer):
     special = [_AUDIO_PLACEHOLDER]
     existing = set(tokenizer.get_vocab().keys())
@@ -84,6 +108,20 @@ def _load_nemo_perception(perception_cfg: dict, output_dim: int) -> nn.Module:
     perception = AudioPerceptionModule(cfg)
     perception.eval()
     return perception
+
+
+def _pad_vocab_tensor(tensor: torch.Tensor, target_vocab: int) -> torch.Tensor:
+    if tensor.shape[0] < target_vocab:
+        pad = torch.zeros(
+            target_vocab - tensor.shape[0],
+            *tensor.shape[1:],
+            dtype=tensor.dtype,
+        )
+        tensor = torch.cat([tensor, pad], dim=0)
+    return tensor
+
+
+# ── Multimodal plumbing (shared by both model classes) ──────────────
 
 
 class NeMoSpeechLMAudioInputs(TensorSchema):
@@ -186,8 +224,8 @@ class NeMoSpeechLMMultiModalProcessor(
         audios = mm_data.pop("audios", [])
 
         if audios:
-            audio_list = []
-            audio_lengths = []
+            audio_list: list[torch.Tensor] = []
+            audio_lengths: list[int] = []
             parts = re.split(
                 f"({re.escape(_AUDIO_PLACEHOLDER)})", prompt
             )
@@ -196,7 +234,8 @@ class NeMoSpeechLMMultiModalProcessor(
                 if part == _AUDIO_PLACEHOLDER and audio_idx < len(audios):
                     audio = audios[audio_idx]
                     audio_tensor = (
-                        audio if isinstance(audio, torch.Tensor)
+                        audio
+                        if isinstance(audio, torch.Tensor)
                         else torch.as_tensor(audio, dtype=torch.float32)
                     )
                     if audio_tensor.dim() > 1:
@@ -243,18 +282,21 @@ class NeMoSpeechLMDummyInputsBuilder(
         return "Transcribe the following: " + _AUDIO_PLACEHOLDER * num_audios
 
 
-@MULTIMODAL_REGISTRY.register_processor(
-    NeMoSpeechLMMultiModalProcessor,
-    info=NeMoSpeechLMProcessingInfo,
-    dummy_inputs=NeMoSpeechLMDummyInputsBuilder,
-)
-class NeMoSpeechLMForConditionalGeneration(
-    nn.Module,
-    SupportsMultiModal,
-    SupportsPP,
-    IsHybrid,
-    SupportsMambaPrefixCaching,
-):
+# ── Shared base class ───────────────────────────────────────────────
+
+
+class _NeMoSpeechLMBase(nn.Module):
+    """Common perception loading, audio processing, forward, and logits."""
+
+    def _init_perception(
+        self, config, vllm_config: VllmConfig
+    ):
+        llm_hidden = config.text_config.hidden_size
+        with self._mark_tower_model(vllm_config, {"audio"}):
+            self.perception = _load_nemo_perception(
+                config.perception, output_dim=llm_hidden
+            )
+            self.perception = self.perception.to(torch.float32)
 
     @classmethod
     def get_placeholder_str(cls, modality: str, i: int) -> str | None:
@@ -262,45 +304,7 @@ class NeMoSpeechLMForConditionalGeneration(
             return _AUDIO_PLACEHOLDER
         return None
 
-    @classmethod
-    def get_mamba_state_dtype_from_config(cls, vllm_config):
-        from vllm.model_executor.models.nemotron_h import NemotronHForCausalLM
-        return NemotronHForCausalLM.get_mamba_state_dtype_from_config(vllm_config)
-
-    @classmethod
-    def get_mamba_state_shape_from_config(cls, vllm_config):
-        from vllm.model_executor.models.nemotron_h import NemotronHForCausalLM
-        return NemotronHForCausalLM.get_mamba_state_shape_from_config(vllm_config)
-
-    @classmethod
-    def get_mamba_state_copy_func(cls):
-        from vllm.model_executor.models.nemotron_h import NemotronHForCausalLM
-        return NemotronHForCausalLM.get_mamba_state_copy_func()
-
-    def __init__(self, *, vllm_config: VllmConfig, prefix: str = ""):
-        super().__init__()
-        config = vllm_config.model_config.hf_config
-        self.config = config
-
-        with self._mark_language_model(vllm_config):
-            self.language_model = init_vllm_registered_model(
-                vllm_config=vllm_config,
-                hf_config=config.text_config,
-                prefix=maybe_prefix(prefix, "language_model"),
-                architectures=["NemotronHForCausalLM"],
-            )
-
-        llm_hidden = config.text_config.hidden_size
-
-        with self._mark_tower_model(vllm_config, {"audio"}):
-            self.perception = _load_nemo_perception(
-                config.perception, output_dim=llm_hidden
-            )
-            self.perception = self.perception.to(torch.float32)
-
-        self.make_empty_intermediate_tensors = (
-            self.language_model.make_empty_intermediate_tensors
-        )
+    # ── audio processing ──
 
     def _parse_audio_input(
         self, **kwargs
@@ -361,6 +365,8 @@ class NeMoSpeechLMForConditionalGeneration(
             return []
         return self._process_audio(audio_input)
 
+    # ── forward / logits ──
+
     def forward(
         self,
         input_ids: torch.Tensor,
@@ -387,11 +393,101 @@ class NeMoSpeechLMForConditionalGeneration(
             tower_model="perception.encoder",
         )
 
+    # ── weight loading helpers ──
+
+    def _load_perception_weights(
+        self, perception_weights: dict[str, torch.Tensor]
+    ) -> set[str]:
+        float32_weights = {
+            k: v.float() for k, v in perception_weights.items()
+        }
+        self.perception.load_state_dict(float32_weights, strict=False)
+        self.perception = self.perception.to(torch.float32)
+        return {"perception." + k for k in perception_weights}
+
+    @staticmethod
+    def _split_perception_llm(
+        weights: Iterable[tuple[str, torch.Tensor]],
+    ) -> tuple[dict[str, torch.Tensor], list[tuple[str, torch.Tensor]]]:
+        perception: dict[str, torch.Tensor] = {}
+        llm: list[tuple[str, torch.Tensor]] = []
+        for name, tensor in weights:
+            if "._extra_state" in name:
+                continue
+            if name.startswith("perception."):
+                perception[name[len("perception."):]] = tensor
+            else:
+                llm.append((name, tensor))
+        return perception, llm
+
+
+# ── Hybrid (NemotronH / Mamba+MoE) variant ─────────────────────────
+
+
+@MULTIMODAL_REGISTRY.register_processor(
+    NeMoSpeechLMMultiModalProcessor,
+    info=NeMoSpeechLMProcessingInfo,
+    dummy_inputs=NeMoSpeechLMDummyInputsBuilder,
+)
+class NeMoSpeechLMForConditionalGeneration(
+    _NeMoSpeechLMBase,
+    SupportsMultiModal,
+    SupportsPP,
+    IsHybrid,
+    SupportsMambaPrefixCaching,
+):
+    """NeMo Speech LM with hybrid Mamba+MoE backbone (e.g. NemotronH)."""
+
+    @classmethod
+    def get_mamba_state_dtype_from_config(cls, vllm_config):
+        from vllm.model_executor.models.nemotron_h import (
+            NemotronHForCausalLM,
+        )
+        return NemotronHForCausalLM.get_mamba_state_dtype_from_config(
+            vllm_config
+        )
+
+    @classmethod
+    def get_mamba_state_shape_from_config(cls, vllm_config):
+        from vllm.model_executor.models.nemotron_h import (
+            NemotronHForCausalLM,
+        )
+        return NemotronHForCausalLM.get_mamba_state_shape_from_config(
+            vllm_config
+        )
+
+    @classmethod
+    def get_mamba_state_copy_func(cls):
+        from vllm.model_executor.models.nemotron_h import (
+            NemotronHForCausalLM,
+        )
+        return NemotronHForCausalLM.get_mamba_state_copy_func()
+
+    def __init__(self, *, vllm_config: VllmConfig, prefix: str = ""):
+        super().__init__()
+        config = vllm_config.model_config.hf_config
+        self.config = config
+
+        with self._mark_language_model(vllm_config):
+            self.language_model = init_vllm_registered_model(
+                vllm_config=vllm_config,
+                hf_config=config.text_config,
+                prefix=maybe_prefix(prefix, "language_model"),
+                architectures=["NemotronHForCausalLM"],
+            )
+
+        self._init_perception(config, vllm_config)
+        self.make_empty_intermediate_tensors = (
+            self.language_model.make_empty_intermediate_tensors
+        )
+
     def _nemo_to_hf_llm_weights(
         self, weights: Iterable[tuple[str, torch.Tensor]]
     ) -> Iterable[tuple[str, torch.Tensor]]:
-        """Convert NeMo checkpoint weight names to HuggingFace NemotronH
-        format that vLLM's NemotronHForCausalLM.load_weights() expects."""
+        """NeMo -> HuggingFace NemotronH weight name mapping."""
+        target_vocab = getattr(
+            self.config.text_config, "vocab_size", None
+        )
         for name, tensor in weights:
             hf_name = name.replace("llm.model.", "backbone.")
             hf_name = hf_name.replace("llm.lm_head", "lm_head")
@@ -400,8 +496,7 @@ class NeMoSpeechLMForConditionalGeneration(
 
             if hf_name.endswith(".experts.down_projs"):
                 prefix = hf_name.replace(".experts.down_projs", "")
-                n_experts = tensor.shape[0]
-                for i in range(n_experts):
+                for i in range(tensor.shape[0]):
                     yield (
                         f"{prefix}.experts.{i}.down_proj.weight",
                         tensor[i].t(),
@@ -410,23 +505,17 @@ class NeMoSpeechLMForConditionalGeneration(
                 prefix = hf_name.replace(
                     ".experts.gate_and_up_projs", ""
                 )
-                n_experts = tensor.shape[0]
-                for i in range(n_experts):
+                for i in range(tensor.shape[0]):
                     yield (
                         f"{prefix}.experts.{i}.up_proj.weight",
                         tensor[i].t(),
                     )
-            elif hf_name in ("backbone.embed_tokens.weight", "lm_head.weight"):
-                target_vocab = getattr(
-                    self.config.text_config, "vocab_size", tensor.shape[0]
-                )
-                if tensor.shape[0] < target_vocab:
-                    pad = torch.zeros(
-                        target_vocab - tensor.shape[0],
-                        *tensor.shape[1:],
-                        dtype=tensor.dtype,
-                    )
-                    tensor = torch.cat([tensor, pad], dim=0)
+            elif hf_name in (
+                "backbone.embed_tokens.weight",
+                "lm_head.weight",
+            ):
+                if target_vocab:
+                    tensor = _pad_vocab_tensor(tensor, target_vocab)
                 yield (hf_name, tensor)
             else:
                 yield (hf_name, tensor)
@@ -434,29 +523,158 @@ class NeMoSpeechLMForConditionalGeneration(
     def load_weights(
         self, weights: Iterable[tuple[str, torch.Tensor]]
     ) -> set[str]:
-        perception_weights = {}
-        perception_prefix = "perception."
-        llm_raw: list[tuple[str, torch.Tensor]] = []
-
-        for name, tensor in weights:
-            if "._extra_state" in name:
-                continue
-            if name.startswith(perception_prefix):
-                key = name[len(perception_prefix):]
-                perception_weights[key] = tensor
-            else:
-                llm_raw.append((name, tensor))
-
-        float32_weights = {
-            k: v.float() for k, v in perception_weights.items()
-        }
-        self.perception.load_state_dict(float32_weights, strict=False)
-        self.perception = self.perception.to(torch.float32)
-        loaded_perception = {
-            perception_prefix + k for k in perception_weights
-        }
+        perception_weights, llm_raw = self._split_perception_llm(weights)
+        loaded_perception = self._load_perception_weights(perception_weights)
 
         hf_weights = self._nemo_to_hf_llm_weights(llm_raw)
+        combined = (
+            ("language_model." + n, t) for n, t in hf_weights
+        )
+
+        loader = AutoWeightsLoader(self)
+        loaded_llm = loader.load_weights(combined)
+
+        return loaded_llm | loaded_perception
+
+
+# ── Standard transformer variant ────────────────────────────────────
+
+
+@MULTIMODAL_REGISTRY.register_processor(
+    NeMoSpeechLMMultiModalProcessor,
+    info=NeMoSpeechLMProcessingInfo,
+    dummy_inputs=NeMoSpeechLMDummyInputsBuilder,
+)
+class NeMoSpeechLMStdForConditionalGeneration(
+    _NeMoSpeechLMBase,
+    SupportsMultiModal,
+    SupportsPP,
+):
+    """NeMo Speech LM with standard transformer backbone (e.g. Qwen3).
+
+    Handles both PEFT-wrapped checkpoints (``llm.base_model.model.model.``)
+    and plain NeMo checkpoints (``llm.model.``).  LoRA weights are merged
+    inline in float32 during loading.
+    """
+
+    def __init__(self, *, vllm_config: VllmConfig, prefix: str = ""):
+        super().__init__()
+        config = vllm_config.model_config.hf_config
+        self.config = config
+        llm_archs = config.llm_architectures
+
+        with self._mark_language_model(vllm_config):
+            self.language_model = init_vllm_registered_model(
+                vllm_config=vllm_config,
+                hf_config=config.text_config,
+                prefix=maybe_prefix(prefix, "language_model"),
+                architectures=llm_archs,
+            )
+
+        self._init_perception(config, vllm_config)
+        self.make_empty_intermediate_tensors = (
+            self.language_model.make_empty_intermediate_tensors
+        )
+
+    # ── LoRA merge ──
+
+    @staticmethod
+    def _merge_lora_weights(
+        weights: list[tuple[str, torch.Tensor]],
+        lora_cfg: dict | None,
+    ) -> Iterable[tuple[str, torch.Tensor]]:
+        """Merge PEFT LoRA A/B into base weights in float32."""
+        has_lora = any(
+            ".lora_A." in n or ".lora_B." in n for n, _ in weights
+        )
+        if not has_lora:
+            yield from weights
+            return
+
+        if not lora_cfg:
+            lora_cfg = {"r": 128, "lora_alpha": 256}
+        scaling = lora_cfg.get("lora_alpha", 1) / lora_cfg.get("r", 1)
+
+        base: dict[str, torch.Tensor] = {}
+        lora_a: dict[str, torch.Tensor] = {}
+        lora_b: dict[str, torch.Tensor] = {}
+        other: list[tuple[str, torch.Tensor]] = []
+
+        for name, tensor in weights:
+            if ".lora_A.default.weight" in name:
+                key = name.replace(".lora_A.default.weight", ".weight")
+                lora_a[key] = tensor
+            elif ".lora_B.default.weight" in name:
+                key = name.replace(".lora_B.default.weight", ".weight")
+                lora_b[key] = tensor
+            elif ".base_layer.weight" in name:
+                key = name.replace(".base_layer.weight", ".weight")
+                base[key] = tensor
+            else:
+                other.append((name, tensor))
+
+        merged_count = 0
+        for key, tensor in base.items():
+            if key in lora_a and key in lora_b:
+                orig_dtype = tensor.dtype
+                a = lora_a.pop(key).float()
+                b = lora_b.pop(key).float()
+                tensor = (tensor.float() + scaling * (b @ a)).to(orig_dtype)
+                merged_count += 1
+            yield (key, tensor)
+
+        logger.info(
+            "Merged %d LoRA weight pairs (scaling=%.4f)",
+            merged_count,
+            scaling,
+        )
+        yield from other
+
+    # ── weight name mapping ──
+
+    def _nemo_to_hf_llm_weights(
+        self, weights: Iterable[tuple[str, torch.Tensor]]
+    ) -> Iterable[tuple[str, torch.Tensor]]:
+        """Map NeMo/PEFT weight names to HuggingFace standard format.
+
+        Handles:
+          - PEFT-wrapped: ``llm.base_model.model.model.`` -> ``model.``
+          - Plain NeMo:   ``llm.model.`` -> ``model.``
+          - Standalone:   ``embed_tokens.weight`` -> ``model.embed_tokens.weight``
+          - LM head:      ``llm.lm_head.weight`` -> ``lm_head.weight``
+        """
+        target_vocab = getattr(
+            self.config.text_config, "vocab_size", None
+        )
+
+        for name, tensor in weights:
+            if name == "embed_tokens.weight":
+                if target_vocab:
+                    tensor = _pad_vocab_tensor(tensor, target_vocab)
+                yield ("model.embed_tokens.weight", tensor)
+                continue
+
+            hf = name
+            if hf.startswith("llm.base_model.model."):
+                hf = hf[len("llm.base_model.model."):]
+            elif hf.startswith("llm."):
+                hf = hf[len("llm."):]
+
+            if hf.startswith("lm_head") or hf.startswith("model.embed_tokens"):
+                if target_vocab:
+                    tensor = _pad_vocab_tensor(tensor, target_vocab)
+
+            yield (hf, tensor)
+
+    def load_weights(
+        self, weights: Iterable[tuple[str, torch.Tensor]]
+    ) -> set[str]:
+        perception_weights, llm_raw = self._split_perception_llm(weights)
+        loaded_perception = self._load_perception_weights(perception_weights)
+
+        lora_cfg = getattr(self.config, "lora", None)
+        merged = list(self._merge_lora_weights(llm_raw, lora_cfg))
+        hf_weights = self._nemo_to_hf_llm_weights(merged)
         combined = (
             ("language_model." + n, t) for n, t in hf_weights
         )
