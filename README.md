@@ -1,13 +1,56 @@
-# End-to-End Testing Instructions
+# NeMo SpeechLM vLLM Inference
 
-Testing guide for:
-- NeMo PR #15520: https://github.com/NVIDIA-NeMo/NeMo/pull/15520
-- Skills PR #1308: https://github.com/NVIDIA-NeMo/Skills/pull/1308
+Documentation and orchestration instructions for running NeMo Speech LLM models
+(NemotronH, Qwen3-based, Parakeet) with vLLM on the Draco cluster.
+
+## Architecture
+
+The vLLM plugin code lives in **NeMo** at
+`nemo/collections/speechlm2/vllm/nemotron_v3/`.  It registers two model classes:
+
+| Class | Backbone | Example |
+|-------|----------|---------|
+| `NeMoSpeechLMForConditionalGeneration` | Standard transformer | Qwen3, Parakeet-TDT |
+| `NeMoSpeechLMHybridForConditionalGeneration` | Hybrid Mamba+MoE | NemotronH-30B |
+
+Installing NeMo (`pip install -e NeMo`) registers the plugin via
+`vllm.general_plugins` entry point.  No separate package installation is needed.
+
+The evaluation pipeline scripts (`burst_eval_vllm.py`, `prepare_checkpoint_config.py`,
+`serve_vllm_speechlm.sh`) live in
+[canary-dev](https://gitlab-master.nvidia.com/pzelasko/canary-dev) under
+`speechlm-2026h1/`.
+
+### Related PRs
+
+- NeMo PR #15520: https://github.com/NVIDIA-NeMo/NeMo/pull/15520 (plugin)
+- Skills PR #1308: https://github.com/NVIDIA-NeMo/Skills/pull/1308 (eval backend)
+
+## Cluster Job Submission
+
+Evaluation jobs are submitted from the local machine using `burst_eval_vllm.py`,
+which uses `nemo-run` to orchestrate SLURM jobs on Draco.
+
+Cluster config lives at `canary-dev/speechlm-2026h1/cluster_configs/iad.yaml`
+(created from `TEMPLATE.yaml`).  Key settings:
+
+| Setting | Value |
+|---------|-------|
+| SSH host | `draco_oci_iad` |
+| Job dir | `/lustre/fsw/portfolios/llmservice/users/dongjig/results/speechlm-2026h1` |
+| Accounts | `convai_convaird_nemo-speech`, `nemotron_speech_asr`, `llmservice_nemo_speechlm` |
+| Partitions | `batch_block1,batch_block2,batch_block3,batch_block4` |
+
+Check queue load before submitting to pick the least busy account:
+```bash
+ssh draco_oci_iad "squeue -A convai_convaird_nemo-speech -h | wc -l"
+ssh draco_oci_iad "squeue -A nemotron_speech_asr -h | wc -l"
+```
 
 ## Prerequisites
 
-- Access to Draco cluster (`llmservice_nemo_speechlm` account)
-- 1x A100-80GB GPU
+- Access to Draco cluster (one of the accounts above)
+- 1x A100-80GB GPU (per server instance)
 
 ## Container
 
@@ -98,7 +141,7 @@ llm = LLM(
     model='/lustre/fsw/portfolios/llmservice/users/dongjig/models/nemotron-nano-asr-ckpt',
     tokenizer='nvidia/NVIDIA-Nemotron-3-Nano-30B-A3B-BF16',
     hf_overrides={
-        'architectures': ['NeMoSpeechLMForConditionalGeneration'],
+        'architectures': ['NeMoSpeechLMHybridForConditionalGeneration'],
         'model_type': 'nemo_speechlm',
     },
     trust_remote_code=True,
@@ -198,7 +241,7 @@ DATA = '/lustre/fsw/portfolios/llmservice/users/dongjig/asr-leaderboard-data/nem
 
 llm = LLM(
     model=MODEL, tokenizer=TOKENIZER,
-    hf_overrides={'architectures': ['NeMoSpeechLMForConditionalGeneration'], 'model_type': 'nemo_speechlm'},
+    hf_overrides={'architectures': ['NeMoSpeechLMHybridForConditionalGeneration'], 'model_type': 'nemo_speechlm'},
     trust_remote_code=True, dtype='bfloat16', gpu_memory_utilization=0.90,
     enforce_eager=True, max_model_len=4096, limit_mm_per_prompt={'audio': 1},
 )
