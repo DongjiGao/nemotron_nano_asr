@@ -288,111 +288,141 @@ print(f'Samples: {len(all_refs)}, WER: {wer:.2f}%, Time: {time.time()-t_start:.0
 **Expected**: `WER: 1.91%` (matching NeMo checkpoint). Takes ~7.5 min on A100-80GB
 (~99s model load from Lustre + ~349s inference).
 
-## Step 8: Run evaluation with multi-GPU chunks (Skills pipeline)
+## Step 8: Run cluster evaluation with `burst_eval_vllm.py`
 
-For faster evaluation, use the NeMo-Skills `ns generate` pipeline which
-orchestrates multi-GPU evaluation via Slurm. It splits data into N chunks,
-launches N independent single-GPU servers (each with its own vLLM instance),
-and auto-merges results when all chunks complete.
+The recommended way to run full leaderboard evaluations on the cluster.
+The script lives in [canary-dev](https://gitlab-master.nvidia.com/dongjig/canary-dev)
+at `speechlm-2026h1/burst_eval_vllm.py`.
 
-This tests the Skills PR #1308 backend integration.
+It handles everything automatically:
+- **Auto-detects** model architecture (hybrid vs standard) and tokenizer from `config.json`
+- **Uploads** NeMo code + server wrapper to the cluster
+- **Submits** N parallel SLURM jobs (each with its own vLLM server + eval client)
+- **Merges** results and computes metrics
 
-**Differences from Step 7:**
-- Step 7: single Python process, `LLM()` called directly, no server
-- Step 8: Slurm-managed jobs, each chunk has a server + client, results auto-merged
-
-**Why `serve_with_nvme.sh`?** The 60GB checkpoint loads ~5x faster from local
-NVMe (`/tmp`) than from Lustre. The wrapper copies the checkpoint before starting
-the server. This is especially important for multi-GPU jobs where all nodes
-read the same Lustre file simultaneously, causing I/O contention.
-
-**Prerequisites (one-time, on login node):**
+### Prerequisites (one-time, on local machine)
 
 ```bash
-pip install nemo-run hydra-core
+# Install nemo-skills (for pipeline orchestration)
+cd ~/Skills && pip install -e . --no-deps
+
+# Create cluster config from template
+cd ~/canary-dev/speechlm-2026h1
+cp cluster_configs/TEMPLATE.yaml cluster_configs/iad.yaml
+# Edit iad.yaml: set ssh_tunnel.host, user, job_dir, account
 ```
 
-**Run with 8 GPUs (8 independent servers):**
+### Prepare a checkpoint for vLLM (one-time per checkpoint)
+
+Before evaluating, patch the checkpoint's config for vLLM:
 
 ```bash
-# Set these for your environment
-CLUSTER_CONFIG=/home/dongjig/Skills/cluster_configs  # contains draco.yaml
-DATA_DIR=/lustre/fsw/portfolios/llmservice/users/dongjig/asr-leaderboard-data/nemo_skills_jsonl
-CKPT=/lustre/fsw/portfolios/llmservice/users/dongjig/models/nemotron-nano-asr-ckpt
-OUTDIR=/lustre/fsw/portfolios/llmservice/users/$USER/results/librispeech_clean
+cd ~/canary-dev/speechlm-2026h1
 
-ns generate \
-    --cluster draco \
-    --config_dir ${CLUSTER_CONFIG} \
-    --input_file ${DATA_DIR}/librispeech_clean.jsonl \
-    --output_dir ${OUTDIR} \
-    --model ${CKPT} \
-    --server_type generic \
-    --server_entrypoint "bash /lustre/fsw/portfolios/llmservice/users/dongjig/scripts/serve_with_nvme.sh" \  # copies checkpoint to local NVMe before starting server
-    --server_args "--backend vllm_nemo_speechlm --batch_size 32 \
-        --tokenizer nvidia/NVIDIA-Nemotron-3-Nano-30B-A3B-BF16 \
-        --gpu_memory_utilization 0.90" \
-    --server_container vllm-asr \
-    --server_gpus 1 \
-    --num_chunks 8 \
-    --expname librispeech-test \
-    --installation_command "true" \
-    ++prompt_format=openai ++prompt_config=null \
-    ++enable_audio=true ++server.server_type=vllm_multimodal \
-    ++max_concurrent_requests=32 \
-    ++inference.temperature=0.0 ++inference.tokens_to_generate=512 \
-    ++enable_audio_chunking=true \
-    ++eval_type=audio ++eval_config.normalization_mode=hf_leaderboard
+python prepare_checkpoint_config.py /path/to/checkpoint
+
+# Dry-run to see what would change:
+python prepare_checkpoint_config.py /path/to/checkpoint --dry-run
 ```
 
-```
+This patches `config.json` (model_type, architectures), copies the tokenizer
+from the base LLM, overrides the chat template, and writes `generation_config.json`
+for greedy decoding.
 
-This submits 8 Slurm jobs. Each loads the model on 1 GPU, processes its chunk,
-and writes `output_chunk_N.jsonl`. When all chunks finish, results are merged
-into `output.jsonl`.
-
-### Summarize results with `ns summarize_results`
-
-After `ns generate` completes, compute corpus-level WER:
+### Evaluate a single pre-converted checkpoint
 
 ```bash
-# Create directory structure expected by ns summarize_results
-mkdir -p ${OUTDIR}/../summary/asr-leaderboard
-ln -sf ${OUTDIR}/output.jsonl ${OUTDIR}/../summary/asr-leaderboard/output.jsonl
+cd ~/canary-dev/speechlm-2026h1
 
-# Run summarization
-ns summarize_results ${OUTDIR}/../summary
+PYTHONPATH=~/Skills:$PYTHONPATH \
+NEMO_SKILLS_CONFIG=$PWD/cluster_configs \
+NEMO_SKILLS_DISABLE_UNCOMMITTED_CHANGES_CHECK=1 \
+python burst_eval_vllm.py \
+    --model-dir /lustre/fsw/.../canary-qwen-2.5b-hf \
+    --cluster iad \
+    --benchmarks asr-leaderboard \
+    --server-gpus 1 \
+    --num-chunks 8 \
+    --nemo-dir /tmp/NeMo_lite \
+    --data-dir /lustre/fsw/.../skills_data
 ```
 
-**Expected output**:
-```
-------------------------------------- asr-leaderboard -------------------------------------
-evaluation_mode | avg_tokens | gen_seconds | success_rate | no_answer | wer   | num_entries
-pass@1          | -1         | 108         | 99.54%       | 0.00%     | 1.91% | 2620
-```
+Key arguments:
 
-This computes corpus-level WER using the same method as the NeMo checkpoint evaluation.
-Metrics are also saved to `metrics.json` for programmatic access.
+| Argument | Description |
+|----------|-------------|
+| `--model-dir` | Path to the HF checkpoint on the cluster |
+| `--cluster` | Cluster config name (matches `cluster_configs/iad.yaml`) |
+| `--benchmarks` | `asr-leaderboard`, `audio`, `text`, `all`, or comma-separated list |
+| `--server-gpus` | GPUs per vLLM server instance (1 for most models) |
+| `--num-chunks` | Number of parallel eval chunks (each gets its own server) |
+| `--nemo-dir` | Local NeMo directory to upload (must contain the vLLM plugin) |
+| `--data-dir` | Path to prepared Skills dataset on the cluster |
+| `--tokenizer` | Auto-detected from checkpoint config; override if needed |
+| `--hf-overrides` | Auto-detected architecture; override if needed |
+| `--dry-run` | Print commands without submitting |
 
-**Monitor progress:**
+### Burst mode (evaluate all checkpoints in an experiment)
+
 ```bash
-squeue -u $USER  # check running jobs
-ls /lustre/fsw/portfolios/llmservice/users/$USER/results/librispeech_clean/output_chunk_*.jsonl.done  # check completed chunks
+python burst_eval_vllm.py \
+    --expname nano-v3-canary-v2-4node \
+    --config nano-v3-canary-v2-asr.yaml \
+    --cluster iad \
+    --benchmarks asr-leaderboard \
+    --server-gpus 1 \
+    --num-chunks 8 \
+    --nemo-dir /tmp/NeMo_lite \
+    --data-dir /lustre/fsw/.../skills_data
 ```
 
-**Expected**: ~1.91% WER.
+This discovers all `*.ckpt` files, converts them to HF format, and evaluates each.
 
-Timing breakdown (8 chunks, librispeech_clean, A100-80GB):
+### Monitor and collect results
 
-| Phase | Per chunk | Notes |
-|---|---|---|
-| Server startup (NVMe copy + model load + warmup) | ~64s | Runs in parallel across all chunks |
-| Inference (328 samples, BS=32) | ~77s | Slowest chunk |
-| **Total wall-clock** | **~141s (2.4 min)** | vs 7.5 min single GPU (3.2x speedup) |
+```bash
+# Check job status
+ssh draco_oci_iad "squeue -u dongjig"
 
-Speedup is larger on bigger datasets where inference dominates over model load.
+# After eval chunks complete, cancel the idle server job to unblock metrics
+ssh draco_oci_iad "scancel <server_job_id>"
 
-**Available datasets** (all 8 Open ASR Leaderboard datasets):
+# Compute metrics manually if the metrics job didn't run
+PYTHONPATH=~/Skills:$PYTHONPATH \
+NEMO_SKILLS_CONFIG=$PWD/cluster_configs \
+python -m nemo_skills.pipeline.summarize_results \
+    /lustre/fsw/.../vllm_eval/eval-results \
+    --benchmarks asr-leaderboard \
+    --cluster iad
+```
+
+### Verified results (canary-qwen-2.5b, ASR leaderboard)
+
+| Dataset | WER |
+|---------|-----|
+| **Average** | **5.56%** |
+| librispeech_clean | 1.62% |
+| librispeech_other | 3.07% |
+| tedlium | 2.64% |
+| spgispeech | 1.90% |
+| voxpopuli | 5.60% |
+| gigaspeech | 9.23% |
+| earnings22 | 10.44% |
+| ami | 9.99% |
+
+### How it works internally
+
+1. `burst_eval_vllm.py` reads the checkpoint's `config.json` via SSH
+2. Auto-detects the LLM backbone and selects the correct vLLM model class
+3. Uploads NeMo code + `serve_vllm_speechlm.sh` to the cluster
+4. Submits N SLURM jobs via `nemo-run`, each running:
+   - `serve_vllm_speechlm.sh`: installs NeMo plugin, exports `VLLM_PLUGINS=nemo_speechlm`, starts vLLM server
+   - Eval client: sends audio requests to the server, writes `output_chunk_N.jsonl`
+5. When the client finishes, the job kills the server and exits
+6. A final metrics job merges chunks and computes WER
+
+### Available benchmark datasets
+
 ```
 librispeech_clean.jsonl   (2,620 samples)
 librispeech_other.jsonl   (2,939 samples)
@@ -403,60 +433,6 @@ gigaspeech.jsonl          (19,898 samples)
 earnings22.jsonl          (2,737 samples)
 ami.jsonl                 (11,653 samples)
 ```
-All at: `/lustre/fsw/portfolios/llmservice/users/dongjig/asr-leaderboard-data/nemo_skills_jsonl/`
-
-## Step 9: Run full leaderboard with `ns eval` (all-in-one)
-
-`ns eval` combines generate + evaluate + summarize in one command. It reads
-benchmark data from `nemo_skills/dataset/asr-leaderboard/`, runs inference,
-computes WER, and prints a summary table.
-
-**Prerequisites**: The JSONL files in `nemo_skills/dataset/asr-leaderboard/`
-must include audio paths in messages (see Step 1 for setup).
-
-```bash
-ns eval \
-    --cluster draco \
-    --config_dir /home/dongjig/Skills/cluster_configs \
-    --benchmarks asr-leaderboard \
-    --output_dir /lustre/fsw/portfolios/llmservice/users/$USER/results/ns_eval_test \
-    --model /lustre/fsw/portfolios/llmservice/users/dongjig/models/nemotron-nano-asr-ckpt \
-    --server_type generic \
-    --server_entrypoint "bash /lustre/fsw/portfolios/llmservice/users/dongjig/scripts/serve_with_nvme.sh" \
-    --server_args "--backend vllm_nemo_speechlm --batch_size 32 \
-        --tokenizer nvidia/NVIDIA-Nemotron-3-Nano-30B-A3B-BF16 \
-        --gpu_memory_utilization 0.90" \
-    --server_container /lustre/fsw/portfolios/llmservice/users/dongjig/containers/vllm-asr-v3.sqsh \
-    --server_gpus 1 \
-    --num_chunks 8 \
-    --expname ns-eval-test \
-    --installation_command "true" \
-    ++server.server_type=vllm_multimodal \
-    ++max_concurrent_requests=32 \
-    ++inference.temperature=0.0 \
-    ++inference.tokens_to_generate=512 \
-    ++enable_audio_chunking=true
-```
-
-After all chunks finish, run `ns summarize_results`:
-```bash
-ns summarize_results /lustre/fsw/portfolios/llmservice/users/$USER/results/ns_eval_test/eval-results
-```
-
-**Expected output** (verified):
-```
-------------------------------------- asr-leaderboard -------------------------------------
-evaluation_mode | avg_tokens | gen_seconds | success_rate | no_answer | wer   | num_entries
-pass@1          | -1         | 1309        | 98.43%       | 0.05%     | 4.65% | 67795
-
-Dataset breakdown:
-  librispeech_clean:  1.93%  (2,620 samples)
-  librispeech_other:  3.69%  (2,939 samples)
-  tedlium:            3.70%  (1,155 samples)
-  spgispeech:         2.21%  (39,341 samples)
-  voxpopuli:          6.27%  (1,842 samples)
-  gigaspeech:        10.08%  (19,898 samples)
-```
 
 ## Summary of expected results
 
@@ -464,6 +440,5 @@ Dataset breakdown:
 |------|----------|
 | Step 4: Plugin inference | `Concorde returned to its place amidst the tents,` |
 | Step 6: Server request | JSON with transcription |
-| Step 7: Single GPU eval | 1.91% WER, ~7.5 min (99s load + 349s inference) |
-| Step 8: 8-GPU eval (v3 container) | 1.91% WER, ~2.4 min wall-clock (46s load + 96s inference) |
-| Step 9: Full leaderboard via ns eval | 4.65% avg WER across 6 datasets, ~20 min |
+| Step 7: Single GPU eval (NemotronH) | 1.91% WER on librispeech_clean |
+| Step 8: Cluster eval (canary-qwen-2.5b) | 5.56% avg WER across 8 ASR leaderboard datasets |
